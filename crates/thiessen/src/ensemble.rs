@@ -255,7 +255,7 @@ impl<F: CellFamily> Ensemble<F> {
 
         let m = moves::select(current, &self.prior, rng);
         let proposal = moves::propose(m, current, &self.prior, rng, &mut scratch.tessellation);
-        self.assignments[j].updated_into(
+        let known_empty = self.assignments[j].updated_into(
             x,
             &scratch.tessellation,
             proposal.delta,
@@ -264,22 +264,24 @@ impl<F: CellFamily> Ensemble<F> {
             &mut scratch.assignment,
         );
         let proposed_weights = tau.map(|tau| scratch.assignment.soft_weights(tau));
-        self.family.accumulate(
-            &scratch.assignment.cells,
-            input,
-            weights,
-            &scratch.partials,
-            scratch.tessellation.n_cells(),
-            &Context {
-                x,
-                tessellation: &scratch.tessellation,
-                soft: proposed_weights.as_deref(),
-            },
-            &mut scratch.proposed,
-        );
+        if !known_empty {
+            self.family.accumulate(
+                &scratch.assignment.cells,
+                input,
+                weights,
+                &scratch.partials,
+                scratch.tessellation.n_cells(),
+                &Context {
+                    x,
+                    tessellation: &scratch.tessellation,
+                    soft: proposed_weights.as_deref(),
+                },
+                &mut scratch.proposed,
+            );
+        }
         // A proposal leaving a cell empty is rejected before the acceptance
         // draw, so no uniform is consumed.
-        if scratch.proposed.all_occupied() {
+        if !known_empty && scratch.proposed.all_occupied() {
             #[allow(unused_mut)]
             let mut log_alpha = self.family.log_marginal(
                 &scratch.proposed,

@@ -429,3 +429,10 @@ says "Sampled values changed" with the reason.
   the same operations in the same order, so sampled values are the same
   for a fixed seed. The sweep benches run 3 to 6 per cent faster on one
   machine.
+- The incremental reassignment after a centre is added or moved
+  reports whether that centre won no training row. Such a proposal
+  leaves a cell empty and is rejected before the acceptance draw
+  whatever its statistics, so they are no longer accumulated. The
+  random stream is unchanged, so sampled values are the same for a
+  fixed seed. The sweep benches run 4 to 10 per cent faster on one
+  machine.
