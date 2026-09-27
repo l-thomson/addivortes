@@ -51,6 +51,10 @@ struct Scratch<S> {
     current: S,
     values: Vec<f64>,
     slopes: Vec<f64>,
+    /// Whether `partials` and `current` already hold the next
+    /// tessellation's, formed in the previous tessellation's running-total
+    /// pass.
+    primed: bool,
 }
 
 impl<S: Default> Default for Scratch<S> {
@@ -64,6 +68,7 @@ impl<S: Default> Default for Scratch<S> {
             current: S::default(),
             values: Vec::new(),
             slopes: Vec::new(),
+            primed: false,
         }
     }
 }
@@ -152,6 +157,7 @@ impl<F: CellFamily> Ensemble<F> {
         #[cfg(test)] breakage: crate::broken::Breakage,
     ) {
         let mut scratch = std::mem::take(&mut self.scratch);
+        scratch.primed = false;
         for j in 0..self.tessellations.len() {
             self.backfit(
                 &mut scratch,
@@ -192,6 +198,19 @@ impl<F: CellFamily> Ensemble<F> {
         let (weights, total, cells) = (&weights[..n], &self.total[..n], &cells[..n]);
         scratch.partials.resize(n, 0.0);
         let partials = &mut scratch.partials[..n];
+        if soft.is_none() && current.betas.is_empty() {
+            self.family.hard_partials(
+                cells,
+                &current.mus,
+                input,
+                weights,
+                total,
+                partials,
+                &context,
+                &mut scratch.current,
+            );
+            return;
+        }
         for i in 0..n {
             let cell = cells[i];
             let own = match soft {
@@ -229,7 +248,9 @@ impl<F: CellFamily> Ensemble<F> {
     ) {
         let tau = self.tessellations[j].tau;
         let mut soft_weights = tau.map(|tau| self.assignments[j].soft_weights(tau));
-        self.partials(scratch, j, x, input, weights, soft_weights.as_deref());
+        if !std::mem::take(&mut scratch.primed) {
+            self.partials(scratch, j, x, input, weights, soft_weights.as_deref());
+        }
         let current = &self.tessellations[j];
 
         let m = moves::select(current, &self.prior, rng);
@@ -303,7 +324,15 @@ impl<F: CellFamily> Ensemble<F> {
                 breakage,
             );
         }
-        self.redraw(scratch, j, x, input, soft_weights.as_deref(), rng);
+        self.redraw(
+            scratch,
+            j,
+            x,
+            input,
+            soft_weights.as_deref(),
+            Some(weights),
+            rng,
+        );
     }
 
     /// The bandwidth move of soft tessellation `j`: a random-walk
@@ -363,7 +392,11 @@ impl<F: CellFamily> Ensemble<F> {
     }
 
     /// The cell values of tessellation `j` from the statistics in
-    /// `scratch.current`, then the running total.
+    /// `scratch.current`, then the running total. Given the sweep's
+    /// `weights`, when tessellation `j` and the next are both hard with the
+    /// constant basis, the next one's partials and statistics are formed
+    /// in the same pass and `scratch.primed` is set.
+    #[allow(clippy::too_many_arguments)]
     fn redraw(
         &mut self,
         scratch: &mut Scratch<F::Stats>,
@@ -371,6 +404,7 @@ impl<F: CellFamily> Ensemble<F> {
         x: &Data,
         input: &[f64],
         soft: Option<&[f64]>,
+        weights: Option<&[f64]>,
         rng: &mut Rng,
     ) {
         let tessellation = &mut self.tessellations[j];
@@ -385,6 +419,42 @@ impl<F: CellFamily> Ensemble<F> {
         std::mem::swap(&mut tessellation.betas, &mut scratch.slopes);
         let b = tessellation.n_cells();
         let n = input.len();
+        let hard = |t: &Tessellation| t.tau.is_none() && t.betas.is_empty();
+        if soft.is_none() && tessellation.betas.is_empty() {
+            let tessellation = &self.tessellations[j];
+            if let (Some(weights), Some(next)) = (weights, self.tessellations.get(j + 1)) {
+                if hard(next) {
+                    let context = Context {
+                        x,
+                        tessellation: next,
+                        soft: None,
+                    };
+                    self.family
+                        .begin(next.n_cells(), &context, &mut scratch.current);
+                    self.family.hard_totals_then_partials(
+                        &cells[..n],
+                        &tessellation.mus,
+                        &self.assignments[j + 1].cells[..n],
+                        &next.mus,
+                        input,
+                        &weights[..n],
+                        &mut self.total[..n],
+                        &mut scratch.partials[..n],
+                        &context,
+                        &mut scratch.current,
+                    );
+                    scratch.primed = true;
+                    return;
+                }
+            }
+            let (total, partials, cells) =
+                (&mut self.total[..n], &scratch.partials[..n], &cells[..n]);
+            let mus = &tessellation.mus;
+            for i in 0..n {
+                total[i] = self.family.total(input[i], partials[i], mus[cells[i]]);
+            }
+            return;
+        }
         let (total, partials, cells) = (&mut self.total[..n], &scratch.partials[..n], &cells[..n]);
         for i in 0..n {
             let own = match soft {
@@ -418,7 +488,7 @@ impl<F: CellFamily> Ensemble<F> {
             let tau = self.tessellations[j].tau;
             let soft = tau.map(|tau| self.assignments[j].soft_weights(tau));
             self.partials(&mut scratch, j, x, input, weights, soft.as_deref());
-            self.redraw(&mut scratch, j, x, input, soft.as_deref(), rng);
+            self.redraw(&mut scratch, j, x, input, soft.as_deref(), None, rng);
         }
         self.scratch = scratch;
     }

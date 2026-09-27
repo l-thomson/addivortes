@@ -133,6 +133,56 @@ pub(crate) trait CellFamily: sealed::Sealed {
         }
     }
 
+    /// Under hard membership and the constant basis, each observation's
+    /// partial against its cell value `mus[cells[i]]` into `partials`,
+    /// and its [`add`] to `out`, which [`begin`] has started.
+    ///
+    /// [`add`]: Self::add
+    /// [`begin`]: Self::begin
+    #[allow(clippy::too_many_arguments)]
+    fn hard_partials(
+        &self,
+        cells: &[usize],
+        mus: &[f64],
+        input: &[f64],
+        weights: &[f64],
+        total: &[f64],
+        partials: &mut [f64],
+        context: &Context,
+        out: &mut Self::Stats,
+    ) {
+        hard_partials_by_add(
+            self, cells, mus, input, weights, total, partials, context, out,
+        );
+    }
+
+    /// Under hard membership and the constant basis for this tessellation
+    /// and the next, per observation: the total after this tessellation's
+    /// update from `partials[i]` and `mus[cells[i]]` into `total[i]`, then
+    /// [`hard_partials`] of the next tessellation against that total. The
+    /// same operations in the same order as the update followed by the
+    /// next tessellation's own pass.
+    ///
+    /// [`hard_partials`]: Self::hard_partials
+    #[allow(clippy::too_many_arguments)]
+    fn hard_totals_then_partials(
+        &self,
+        cells: &[usize],
+        mus: &[f64],
+        next_cells: &[usize],
+        next_mus: &[f64],
+        input: &[f64],
+        weights: &[f64],
+        total: &mut [f64],
+        partials: &mut [f64],
+        context: &Context,
+        out: &mut Self::Stats,
+    ) {
+        hard_totals_then_partials_by_add(
+            self, cells, mus, next_cells, next_mus, input, weights, total, partials, context, out,
+        );
+    }
+
     /// The T-dependent part of the integrated log-likelihood.
     fn log_marginal(
         &self,
@@ -164,6 +214,63 @@ pub(crate) trait CellFamily: sealed::Sealed {
     /// without one.
     #[cfg(test)]
     fn cell_normaliser(&self) -> f64;
+}
+
+/// [`CellFamily::hard_partials`] through [`CellFamily::add`].
+#[allow(clippy::too_many_arguments)]
+fn hard_partials_by_add<F: CellFamily + ?Sized>(
+    family: &F,
+    cells: &[usize],
+    mus: &[f64],
+    input: &[f64],
+    weights: &[f64],
+    total: &[f64],
+    partials: &mut [f64],
+    context: &Context,
+    out: &mut F::Stats,
+) {
+    let n = cells.len();
+    let (input, weights, total) = (&input[..n], &weights[..n], &total[..n]);
+    let partials = &mut partials[..n];
+    for i in 0..n {
+        let partial = family.partial(input[i], total[i], mus[cells[i]]);
+        partials[i] = partial;
+        family.add(out, i, cells[i], input[i], weights[i], partial, context);
+    }
+}
+
+/// [`CellFamily::hard_totals_then_partials`] through [`CellFamily::add`].
+#[allow(clippy::too_many_arguments)]
+fn hard_totals_then_partials_by_add<F: CellFamily + ?Sized>(
+    family: &F,
+    cells: &[usize],
+    mus: &[f64],
+    next_cells: &[usize],
+    next_mus: &[f64],
+    input: &[f64],
+    weights: &[f64],
+    total: &mut [f64],
+    partials: &mut [f64],
+    context: &Context,
+    out: &mut F::Stats,
+) {
+    let n = cells.len();
+    let (next_cells, input, weights) = (&next_cells[..n], &input[..n], &weights[..n]);
+    let (total, partials) = (&mut total[..n], &mut partials[..n]);
+    for i in 0..n {
+        total[i] = family.total(input[i], partials[i], mus[cells[i]]);
+        let partial = family.partial(input[i], total[i], next_mus[next_cells[i]]);
+        partials[i] = partial;
+        family.add(
+            out,
+            i,
+            next_cells[i],
+            input[i],
+            weights[i],
+            partial,
+            context,
+        );
+    }
 }
 
 /// Gaussian cell means under an additive ensemble; with `linear` the
@@ -202,6 +309,16 @@ pub(crate) struct GaussianCell {
     pub count: usize,
     pub weight: f64,
     pub sum: f64,
+}
+
+impl GaussianCell {
+    /// One observation of weight `weight` and partial `partial`.
+    #[inline]
+    fn add(&mut self, weight: f64, partial: f64) {
+        self.count += 1;
+        self.weight += weight;
+        self.sum += weight * partial;
+    }
 }
 
 impl Stats for GaussianStats {
@@ -267,6 +384,68 @@ impl CellFamily for GaussianCells {
         c.sum += weight * partial;
         if self.linear {
             add_slopes(out, i, cell, weight, partial, context);
+        }
+    }
+
+    /// Under the constant basis, without the per-observation membership
+    /// and basis tests of [`add`](CellFamily::add).
+    fn hard_partials(
+        &self,
+        cells: &[usize],
+        mus: &[f64],
+        input: &[f64],
+        weights: &[f64],
+        total: &[f64],
+        partials: &mut [f64],
+        context: &Context,
+        out: &mut GaussianStats,
+    ) {
+        if self.linear {
+            return hard_partials_by_add(
+                self, cells, mus, input, weights, total, partials, context, out,
+            );
+        }
+        let n = cells.len();
+        let (input, weights, total) = (&input[..n], &weights[..n], &total[..n]);
+        let partials = &mut partials[..n];
+        let stats = &mut out.cells[..mus.len()];
+        for i in 0..n {
+            let partial = self.partial(input[i], total[i], mus[cells[i]]);
+            partials[i] = partial;
+            stats[cells[i]].add(weights[i], partial);
+        }
+    }
+
+    /// Under the constant basis, without the per-observation membership
+    /// and basis tests of [`add`](CellFamily::add).
+    fn hard_totals_then_partials(
+        &self,
+        cells: &[usize],
+        mus: &[f64],
+        next_cells: &[usize],
+        next_mus: &[f64],
+        input: &[f64],
+        weights: &[f64],
+        total: &mut [f64],
+        partials: &mut [f64],
+        context: &Context,
+        out: &mut GaussianStats,
+    ) {
+        if self.linear {
+            return hard_totals_then_partials_by_add(
+                self, cells, mus, next_cells, next_mus, input, weights, total, partials, context,
+                out,
+            );
+        }
+        let n = cells.len();
+        let (next_cells, input, weights) = (&next_cells[..n], &input[..n], &weights[..n]);
+        let (total, partials) = (&mut total[..n], &mut partials[..n]);
+        let stats = &mut out.cells[..next_mus.len()];
+        for i in 0..n {
+            total[i] = self.total(input[i], partials[i], mus[cells[i]]);
+            let partial = self.partial(input[i], total[i], next_mus[next_cells[i]]);
+            partials[i] = partial;
+            stats[next_cells[i]].add(weights[i], partial);
         }
     }
 
@@ -1016,6 +1195,184 @@ mod tests {
             .sum::<f64>()
             / n as f64;
         close(mean, 2.5, 0.05);
+    }
+
+    /// The hard-membership passes against their definition through `add`,
+    /// bit for bit: `{:?}` prints every f64 exactly, signed zero included.
+    mod hard {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn value() -> impl Strategy<Value = f64> {
+            prop::num::f64::NORMAL | prop::num::f64::SUBNORMAL | prop::num::f64::ZERO
+        }
+
+        /// Rows over `b` cells and `next_b` next cells, and the values of
+        /// both tessellations.
+        #[derive(Debug, Clone)]
+        struct Case {
+            cells: Vec<usize>,
+            next_cells: Vec<usize>,
+            mus: Vec<f64>,
+            next_mus: Vec<f64>,
+            input: Vec<f64>,
+            weights: Vec<f64>,
+            total: Vec<f64>,
+            partials: Vec<f64>,
+        }
+
+        fn case() -> impl Strategy<Value = Case> {
+            (0usize..48, 1usize..40, 1usize..40).prop_flat_map(|(n, b, next_b)| {
+                let values = || prop::collection::vec(value(), n);
+                (
+                    prop::collection::vec(0..b, n),
+                    prop::collection::vec(0..next_b, n),
+                    prop::collection::vec(value(), b),
+                    prop::collection::vec(value(), next_b),
+                    values(),
+                    prop::collection::vec(value().prop_map(f64::abs), n),
+                    values(),
+                    values(),
+                )
+                    .prop_map(
+                        |(cells, next_cells, mus, next_mus, input, weights, total, partials)| {
+                            Case {
+                                cells,
+                                next_cells,
+                                mus,
+                                next_mus,
+                                input,
+                                weights,
+                                total,
+                                partials,
+                            }
+                        },
+                    )
+            })
+        }
+
+        fn families() -> (GaussianCells, InverseGammaCells) {
+            (
+                GaussianCells {
+                    sigma_mu_sq: 0.25,
+                    linear: false,
+                },
+                InverseGammaCells {
+                    nu: 3.0,
+                    lambda: 0.9,
+                    prior_only: false,
+                },
+            )
+        }
+
+        /// `hard_partials` and its definition, as printed state.
+        fn partials_pair<F: CellFamily>(family: &F, c: &Case) -> (String, String) {
+            let (x, t) = any_ctx(c.cells.len());
+            let context = Context {
+                x: &x,
+                tessellation: &t,
+                soft: None,
+            };
+            let run = |by_add: bool| {
+                let mut out = F::Stats::default();
+                let mut partials = vec![0.0; c.cells.len()];
+                family.begin(c.mus.len(), &context, &mut out);
+                let (cells, mus, input, weights) = (&c.cells, &c.mus, &c.input, &c.weights);
+                if by_add {
+                    hard_partials_by_add(
+                        family,
+                        cells,
+                        mus,
+                        input,
+                        weights,
+                        &c.total,
+                        &mut partials,
+                        &context,
+                        &mut out,
+                    );
+                } else {
+                    family.hard_partials(
+                        cells,
+                        mus,
+                        input,
+                        weights,
+                        &c.total,
+                        &mut partials,
+                        &context,
+                        &mut out,
+                    );
+                }
+                format!("{partials:?} {out:?}")
+            };
+            (run(false), run(true))
+        }
+
+        /// The fused pass, and the running-total update followed by the
+        /// next tessellation's `hard_partials`, as printed state.
+        fn fused_pair<F: CellFamily>(family: &F, c: &Case) -> (String, String) {
+            let (x, t) = any_ctx(c.cells.len());
+            let context = Context {
+                x: &x,
+                tessellation: &t,
+                soft: None,
+            };
+            let n = c.cells.len();
+            let mut fused = F::Stats::default();
+            let (mut total, mut partials) = (c.total.clone(), c.partials.clone());
+            family.begin(c.next_mus.len(), &context, &mut fused);
+            family.hard_totals_then_partials(
+                &c.cells,
+                &c.mus,
+                &c.next_cells,
+                &c.next_mus,
+                &c.input,
+                &c.weights,
+                &mut total,
+                &mut partials,
+                &context,
+                &mut fused,
+            );
+            let got = format!("{total:?} {partials:?} {fused:?}");
+
+            let total: Vec<f64> = (0..n)
+                .map(|i| family.total(c.input[i], c.partials[i], c.mus[c.cells[i]]))
+                .collect();
+            let mut partials = vec![0.0; n];
+            let mut separate = F::Stats::default();
+            family.begin(c.next_mus.len(), &context, &mut separate);
+            hard_partials_by_add(
+                family,
+                &c.next_cells,
+                &c.next_mus,
+                &c.input,
+                &c.weights,
+                &total,
+                &mut partials,
+                &context,
+                &mut separate,
+            );
+            (got, format!("{total:?} {partials:?} {separate:?}"))
+        }
+
+        proptest! {
+            #[test]
+            fn hard_partials_equal_their_definition(c in case()) {
+                let (gaussian, inverse_gamma) = families();
+                let (got, want) = partials_pair(&gaussian, &c);
+                prop_assert_eq!(got, want);
+                let (got, want) = partials_pair(&inverse_gamma, &c);
+                prop_assert_eq!(got, want);
+            }
+
+            #[test]
+            fn the_fused_pass_equals_the_update_then_the_next_pass(c in case()) {
+                let (gaussian, inverse_gamma) = families();
+                let (got, want) = fused_pair(&gaussian, &c);
+                prop_assert_eq!(got, want);
+                let (got, want) = fused_pair(&inverse_gamma, &c);
+                prop_assert_eq!(got, want);
+            }
+        }
     }
 
     mod soft {
