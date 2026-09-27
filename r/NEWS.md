@@ -156,6 +156,10 @@
   rejected before its cell statistics are accumulated; sampled values
   are unchanged and a sweep runs 4 to 10 per cent faster on one
   machine.
+* Where every training row carries the same weight, a cell's total
+  weight is read from running sums formed once per sweep in place of an
+  addition per row; sampled values are unchanged and a Gaussian or
+  probit sweep executes 9 per cent fewer instructions.
 * `thiessen(threads = )` runs the chains of a fit on up to that many
   threads, each chain on one thread with its own generator, and
   `predict()` on the fit, intervals included, splits its rows over the
