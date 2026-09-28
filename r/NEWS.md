@@ -148,6 +148,10 @@
   and the rows that lose their centre under a change or removal take a
   plain Euclidean search; sampled values are unchanged and a sweep runs
   about a fifth faster on one machine.
+* The backfitting step forms the next tessellation's partial residuals
+  and cell statistics in the pass that updates the running total;
+  sampled values are unchanged and a sweep runs 3 to 6 per cent faster
+  on one machine.
 * `thiessen(threads = )` runs the chains of a fit on up to that many
   threads, each chain on one thread with its own generator, and
   `predict()` on the fit, intervals included, splits its rows over the

@@ -420,3 +420,12 @@ says "Sampled values changed" with the reason.
   fit at n = 200, m = 200 and 1200 sweeps takes 1.4 s at p = 5, 10 and
   40 in place of 1.7, 2.2 and 4.6 s. Sampled values are unchanged for a
   fixed seed.
+- Under hard membership with the constant basis, the partials pass and
+  the running-total update read each cell value directly in place of
+  testing the membership and the basis per training row. When the next
+  tessellation is also hard with the constant basis, the running-total
+  pass of one tessellation forms the next one's partials and cell
+  statistics, and the next skips its own pass. Every value is formed by
+  the same operations in the same order, so sampled values are the same
+  for a fixed seed. The sweep benches run 3 to 6 per cent faster on one
+  machine.
