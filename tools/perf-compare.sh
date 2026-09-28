@@ -8,10 +8,13 @@
 # taken on different machines or in different sessions are not comparable,
 # so no stored history exists and no gate reads these numbers.
 #
-# Revision A runs twice, first and last. The A-against-A table is the
-# drift check: a machine that is not quiet shows a difference there, and a
-# comparison taken on it means nothing. Discard the run and close whatever
-# was competing for the core.
+# Both revisions are built before either runs, and the runs alternate
+# a, b, a, b, so neither revision is timed straight after a compilation
+# and each is timed once early and once late. The two A-against-B tables
+# should agree. The A-against-A and B-against-B tables are the drift
+# check: a machine that is not quiet shows a difference there, and a
+# comparison taken on it means nothing. Discard the run and close
+# whatever was competing for the core.
 #
 # Requires critcmp (cargo install critcmp).
 
@@ -35,50 +38,75 @@ root=$(git rev-parse --show-toplevel)
 work=$root/target/perf
 target=$work/target
 mkdir -p "$work"
+# Baselines saved by an earlier run, under another filter, would appear
+# as extra rows in this run's tables.
+rm -rf "$target/criterion"
 
 sha_a=$(git rev-parse --verify "$rev_a^{commit}")
 sha_b=$(git rev-parse --verify "$rev_b^{commit}")
 
-checkouts=()
+dir_a=$work/src-a
+dir_b=$work/src-b
+
+# A checkout left by a run that could not clean up (killed, or a machine
+# restart) is removed here, registration included.
+remove() {
+    git worktree remove --force "$1" 2>/dev/null || rm -rf "$1"
+    git worktree prune
+}
 cleanup() {
-    for dir in "${checkouts[@]}"; do
-        git worktree remove --force "$dir" 2>/dev/null || true
-    done
+    remove "$dir_a"
+    remove "$dir_b"
 }
 trap cleanup EXIT
 
 checkout() {
-    local sha=$1 dir=$work/src-$2
-    rm -rf "$dir"
+    local sha=$1 dir=$2
+    remove "$dir"
     git worktree add --detach --quiet "$dir" "$sha"
-    checkouts+=("$dir")
-    echo "$dir"
 }
 
-dir_a=$(checkout "$sha_a" a)
-dir_b=$(checkout "$sha_b" b)
+checkout "$sha_a" "$dir_a"
+checkout "$sha_b" "$dir_b"
 
-# One baseline name per run, so the two revisions and the repeat sit side
-# by side in one criterion directory for critcmp to read.
-run() {
-    local dir=$1 baseline=$2
-    echo "== $baseline ==" >&2
+bench() {
+    local dir=$1
+    shift
     (
         cd "$dir"
         CARGO_TARGET_DIR=$target cargo bench --locked \
-            --manifest-path bench/Cargo.toml \
-            --bench wall_clock -- --save-baseline "$baseline" $filter
+            --manifest-path bench/Cargo.toml --bench wall_clock "$@"
     )
 }
+
+# One baseline name per run, so the four runs sit side by side in one
+# criterion directory for critcmp to read.
+run() {
+    local dir=$1 baseline=$2
+    echo "== $baseline ==" >&2
+    bench "$dir" -- --save-baseline "$baseline" $filter
+}
+
+bench "$dir_a" --no-run
+bench "$dir_b" --no-run
 
 run "$dir_a" a
 run "$dir_b" b
 run "$dir_a" a-repeat
+run "$dir_b" b-repeat
 
 echo
-echo "$rev_a ($sha_a) against $rev_b ($sha_b)"
+echo "$rev_a ($sha_a) against $rev_b ($sha_b), first pair"
 critcmp --target-dir "$target" a b
 
 echo
-echo "drift: $rev_a against itself, first run against last"
+echo "$rev_a against $rev_b, second pair"
+critcmp --target-dir "$target" a-repeat b-repeat
+
+echo
+echo "drift: $rev_a against itself, first run against second"
 critcmp --target-dir "$target" a a-repeat
+
+echo
+echo "drift: $rev_b against itself, first run against second"
+critcmp --target-dir "$target" b b-repeat

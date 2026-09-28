@@ -39,9 +39,10 @@ old revision against new, both built and run in one session:
     tools/perf-compare.sh <rev-a> <rev-b>     # or: just perf-compare
     cargo install critcmp                     # once
 
-The script runs revision A twice, first and last. The A-against-A table
-is the drift check: a machine that is not quiet shows a difference there,
-and the comparison taken on it means nothing.
+The script builds both revisions first and then runs them alternately,
+A, B, A, B. The two A-against-B tables should agree. The A-against-A and
+B-against-B tables are the drift check: a machine that is not quiet shows
+a difference there, and the comparison taken on it means nothing.
 
 A claimed win below roughly 10% cites the instruction-count delta, not
 wall-clock alone. Code layout by itself moves wall-clock by around 8%
