@@ -369,16 +369,19 @@ fn add_centre_keys(x: &Data, t: &Tessellation, k: usize, out: &mut [f64]) {
 /// rather than a branch because the comparison is a coin flip per row.
 /// The cell takes a mask rather than a select: on baseline x86-64 LLVM
 /// turns a select of the index back into a branch and the loop stops
-/// vectorising.
-fn take_nearer(column: &[f64], k: usize, cells: &mut [usize], best: &mut [f64]) {
+/// vectorising. Returns whether centre `k` took any row.
+fn take_nearer(column: &[f64], k: usize, cells: &mut [usize], best: &mut [f64]) -> bool {
     let n = cells.len();
     let (column, best) = (&column[..n], &mut best[..n]);
+    let mut taken = 0;
     for i in 0..n {
         let nearer = column[i] < best[i];
         let mask = (nearer as usize).wrapping_neg();
         best[i] = if nearer { column[i] } else { best[i] };
         cells[i] ^= (cells[i] ^ k) & mask;
+        taken |= mask;
     }
+    taken != 0
 }
 
 /// `scratch` with at least `len` elements, its contents unspecified.
@@ -497,6 +500,9 @@ impl Assignment {
     /// untouched centre's key against any observation is unchanged, so
     /// only pairs involving the touched centre are recomputed. `scratch`
     /// is the key buffer of the streaming paths.
+    ///
+    /// Returns `true` when the added or moved centre is known to win no
+    /// observation, so that its cell is empty; `false` promises nothing.
     pub(crate) fn updated_into(
         &self,
         x: &Data,
@@ -505,7 +511,7 @@ impl Assignment {
         geometry: &Geometry,
         scratch: &mut Vec<f64>,
         out: &mut Self,
-    ) {
+    ) -> bool {
         let n = x.n_rows();
         match delta {
             Delta::Full => Self::full_into(x, new, geometry, scratch, out),
@@ -515,8 +521,7 @@ impl Assignment {
                 if self.soft.is_none() && geometry.is_plain() {
                     let keys = key_buffer(scratch, n);
                     add_centre_keys(x, new, added, keys);
-                    take_nearer(keys, added, &mut out.cells, &mut out.keys);
-                    return;
+                    return !take_nearer(keys, added, &mut out.cells, &mut out.keys);
                 }
                 if let Some(soft) = &mut out.soft {
                     soft.reserve(n);
@@ -537,9 +542,11 @@ impl Assignment {
                 if self.soft.is_none() && geometry.is_plain() {
                     let keys = key_buffer(scratch, n);
                     add_centre_keys(x, new, moved, keys);
+                    let mut won = false;
                     for (i, &key) in keys.iter().enumerate() {
                         if self.cells[i] == moved {
                             let (cell, key) = nearest_plain(new, x.row(i));
+                            won |= cell == moved;
                             out.cells[i] = cell;
                             out.keys[i] = key;
                         } else if key < self.keys[i]
@@ -547,9 +554,10 @@ impl Assignment {
                         {
                             out.cells[i] = moved;
                             out.keys[i] = key;
+                            won = true;
                         }
                     }
-                    return;
+                    return !won;
                 }
                 for i in 0..n {
                     let row = x.row(i);
@@ -593,6 +601,7 @@ impl Assignment {
                 }
             }
         }
+        false
     }
 
     /// [`updated_into`](Self::updated_into) as a fresh assignment.
@@ -776,6 +785,104 @@ mod tests {
                     cache.updated(&x, &removed, Delta::CentreRemoved(removed_index), &g),
                     Assignment::full(&x, &removed, &g)
                 );
+            }
+        }
+    }
+
+    /// Moved centres that tie an incumbent: the strict lowest-index rule
+    /// decides, not the order of the update.
+    #[test]
+    fn a_moved_centre_tying_an_incumbent_takes_the_row_only_from_a_higher_index() {
+        let x = Data::new(vec![0.0, 0.5], 2, 1).unwrap();
+        let g = Geometry::euclidean(1);
+        for (centres, moved) in [([1.0, 3.0], 1), ([3.0, 1.0], 0)] {
+            let t = Tessellation {
+                centres: centres.to_vec(),
+                dims: vec![0],
+                mus: vec![0.0, 0.0],
+                betas: Vec::new(),
+                tau: None,
+            };
+            let mut new = t.clone();
+            new.centres[moved] = -1.0;
+            let updated =
+                Assignment::full(&x, &t, &g).updated(&x, &new, Delta::CentreMoved(moved), &g);
+            assert_eq!(updated, Assignment::full(&x, &new, &g));
+            assert_eq!(updated.cells[0], 0);
+        }
+    }
+
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// A coordinate on a 0.25 grid, so that keys tie exactly.
+        fn coordinate() -> impl Strategy<Value = f64> {
+            (-4i8..=4).prop_map(|v| f64::from(v) * 0.25)
+        }
+
+        /// Data, a hard tessellation of `b` centres on a shuffled subset
+        /// of the columns, and the index and coordinates of a moved centre.
+        fn case() -> impl Strategy<Value = (Data, Tessellation, usize, Vec<f64>)> {
+            (1usize..4, 1usize..6, 1usize..24).prop_flat_map(|(p, b, n)| {
+                (1..=p).prop_flat_map(move |d| {
+                    (
+                        prop::collection::vec(coordinate(), n * p),
+                        Just((0..p).collect::<Vec<_>>()).prop_shuffle(),
+                        prop::collection::vec(coordinate(), b * d),
+                        0..b,
+                        prop::collection::vec(coordinate(), d),
+                    )
+                        .prop_map(
+                            move |(values, columns, centres, k, moved)| {
+                                let t = Tessellation {
+                                    centres,
+                                    dims: columns[..d].to_vec(),
+                                    mus: vec![0.0; b],
+                                    betas: Vec::new(),
+                                    tau: None,
+                                };
+                                (Data::new(values, n, p).unwrap(), t, k, moved)
+                            },
+                        )
+                })
+            })
+        }
+
+        /// Whether no observation sits in cell `k`.
+        fn empty(a: &Assignment, k: usize) -> bool {
+            !a.cells.contains(&k)
+        }
+
+        proptest! {
+            #[test]
+            fn updates_equal_the_full_recompute_under_ties(
+                (x, t, k, coordinates) in case(),
+            ) {
+                let g = Geometry::euclidean(x.n_cols());
+                let cache = Assignment::full(&x, &t, &g);
+                let d = t.n_dims();
+                let mut scratch = Vec::new();
+                let mut out = Assignment::default();
+
+                let mut moved = t.clone();
+                moved.centres[k * d..(k + 1) * d].copy_from_slice(&coordinates);
+                let known_empty = cache.updated_into(
+                    &x, &moved, Delta::CentreMoved(k), &g, &mut scratch, &mut out,
+                );
+                let full = Assignment::full(&x, &moved, &g);
+                prop_assert_eq!(&out, &full);
+                prop_assert_eq!(known_empty, empty(&full, k));
+
+                let mut added = t.clone();
+                added.centres.extend_from_slice(&coordinates);
+                added.mus.push(0.0);
+                let known_empty = cache.updated_into(
+                    &x, &added, Delta::CentreAdded, &g, &mut scratch, &mut out,
+                );
+                let full = Assignment::full(&x, &added, &g);
+                prop_assert_eq!(&out, &full);
+                prop_assert_eq!(known_empty, empty(&full, t.n_cells()));
             }
         }
     }

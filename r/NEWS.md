@@ -152,6 +152,10 @@
   and cell statistics in the pass that updates the running total;
   sampled values are unchanged and a sweep runs 3 to 6 per cent faster
   on one machine.
+* A proposal whose added or moved centre wins no training row is
+  rejected before its cell statistics are accumulated; sampled values
+  are unchanged and a sweep runs 4 to 10 per cent faster on one
+  machine.
 * `thiessen(threads = )` runs the chains of a fit on up to that many
   threads, each chain on one thread with its own generator, and
   `predict()` on the fit, intervals included, splits its rows over the
