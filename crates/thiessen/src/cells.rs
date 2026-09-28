@@ -68,6 +68,12 @@ pub(crate) struct Context<'a> {
     pub x: &'a Data,
     pub tessellation: &'a Tessellation,
     pub soft: Option<&'a [f64]>,
+    /// When every observation carries the same weight, entry c is c
+    /// copies of it added in turn from zero, for c up to n: under hard
+    /// membership a cell's total weight is then the entry at its count,
+    /// the same bits as adding its observations' weights in order. `None`
+    /// when the weights differ.
+    pub uniform: Option<&'a [f64]>,
 }
 
 /// A conjugate family of cell values with its combination rule across an
@@ -125,12 +131,7 @@ pub(crate) trait CellFamily: sealed::Sealed {
         context: &Context,
         out: &mut Self::Stats,
     ) {
-        self.begin(b, context, out);
-        let n = cells.len();
-        let (input, weights, partials) = (&input[..n], &weights[..n], &partials[..n]);
-        for i in 0..n {
-            self.add(out, i, cells[i], input[i], weights[i], partials[i], context);
-        }
+        accumulate_by_add(self, cells, input, weights, partials, b, context, out);
     }
 
     /// Under hard membership and the constant basis, each observation's
@@ -214,6 +215,26 @@ pub(crate) trait CellFamily: sealed::Sealed {
     /// without one.
     #[cfg(test)]
     fn cell_normaliser(&self) -> f64;
+}
+
+/// [`CellFamily::accumulate`] through [`CellFamily::add`].
+#[allow(clippy::too_many_arguments)]
+fn accumulate_by_add<F: CellFamily + ?Sized>(
+    family: &F,
+    cells: &[usize],
+    input: &[f64],
+    weights: &[f64],
+    partials: &[f64],
+    b: usize,
+    context: &Context,
+    out: &mut F::Stats,
+) {
+    family.begin(b, context, out);
+    let n = cells.len();
+    let (input, weights, partials) = (&input[..n], &weights[..n], &partials[..n]);
+    for i in 0..n {
+        family.add(out, i, cells[i], input[i], weights[i], partials[i], context);
+    }
 }
 
 /// [`CellFamily::hard_partials`] through [`CellFamily::add`].
@@ -312,12 +333,24 @@ pub(crate) struct GaussianCell {
 }
 
 impl GaussianCell {
-    /// One observation of weight `weight` and partial `partial`.
+    /// One observation of weight `weight` and partial `partial`; the
+    /// weight itself is added only with `weigh`, the total weight otherwise
+    /// left to [`weigh_by_count`].
     #[inline]
-    fn add(&mut self, weight: f64, partial: f64) {
+    fn add(&mut self, weight: f64, partial: f64, weigh: bool) {
         self.count += 1;
-        self.weight += weight;
+        if weigh {
+            self.weight += weight;
+        }
         self.sum += weight * partial;
+    }
+}
+
+/// Each cell's total weight from its count and the running sums of the
+/// weight every observation shares; see [`Context::uniform`].
+fn weigh_by_count(cells: &mut [GaussianCell], running: &[f64]) {
+    for c in cells {
+        c.weight = running[c.count];
     }
 }
 
@@ -409,10 +442,14 @@ impl CellFamily for GaussianCells {
         let (input, weights, total) = (&input[..n], &weights[..n], &total[..n]);
         let partials = &mut partials[..n];
         let stats = &mut out.cells[..mus.len()];
+        let weigh = context.uniform.is_none();
         for i in 0..n {
             let partial = self.partial(input[i], total[i], mus[cells[i]]);
             partials[i] = partial;
-            stats[cells[i]].add(weights[i], partial);
+            stats[cells[i]].add(weights[i], partial, weigh);
+        }
+        if let Some(running) = context.uniform {
+            weigh_by_count(stats, running);
         }
     }
 
@@ -441,11 +478,45 @@ impl CellFamily for GaussianCells {
         let (next_cells, input, weights) = (&next_cells[..n], &input[..n], &weights[..n]);
         let (total, partials) = (&mut total[..n], &mut partials[..n]);
         let stats = &mut out.cells[..next_mus.len()];
+        let weigh = context.uniform.is_none();
         for i in 0..n {
             total[i] = self.total(input[i], partials[i], mus[cells[i]]);
             let partial = self.partial(input[i], total[i], next_mus[next_cells[i]]);
             partials[i] = partial;
-            stats[next_cells[i]].add(weights[i], partial);
+            stats[next_cells[i]].add(weights[i], partial, weigh);
+        }
+        if let Some(running) = context.uniform {
+            weigh_by_count(stats, running);
+        }
+    }
+
+    /// Under hard membership and the constant basis, without the
+    /// per-observation membership and basis tests of [`add`].
+    ///
+    /// [`add`]: CellFamily::add
+    fn accumulate(
+        &self,
+        cells: &[usize],
+        input: &[f64],
+        weights: &[f64],
+        partials: &[f64],
+        b: usize,
+        context: &Context,
+        out: &mut GaussianStats,
+    ) {
+        if context.soft.is_some() || self.linear {
+            return accumulate_by_add(self, cells, input, weights, partials, b, context, out);
+        }
+        self.begin(b, context, out);
+        let n = cells.len();
+        let (weights, partials) = (&weights[..n], &partials[..n]);
+        let stats = &mut out.cells[..b];
+        let weigh = context.uniform.is_none();
+        for i in 0..n {
+            stats[cells[i]].add(weights[i], partials[i], weigh);
+        }
+        if let Some(running) = context.uniform {
+            weigh_by_count(stats, running);
         }
     }
 
@@ -824,6 +895,7 @@ mod tests {
             x,
             tessellation,
             soft,
+            uniform: None,
         };
         family.accumulate(
             cells,
@@ -1230,7 +1302,7 @@ mod tests {
                     prop::collection::vec(value(), b),
                     prop::collection::vec(value(), next_b),
                     values(),
-                    prop::collection::vec(value().prop_map(f64::abs), n),
+                    weights(n),
                     values(),
                     values(),
                 )
@@ -1251,6 +1323,47 @@ mod tests {
             })
         }
 
+        /// Non-negative weights, all with the same bits half the time.
+        fn weights(n: usize) -> impl Strategy<Value = Vec<f64>> {
+            let weight = || value().prop_map(f64::abs);
+            prop_oneof![
+                prop::collection::vec(weight(), n),
+                weight().prop_map(move |w| vec![w; n]),
+            ]
+        }
+
+        /// [`Context::uniform`] for `weights`, from its definition; empty
+        /// when the weights differ.
+        fn running(weights: &[f64]) -> Vec<f64> {
+            let equal = weights.windows(2).all(|w| w[0].to_bits() == w[1].to_bits());
+            if weights.is_empty() || !equal {
+                return Vec::new();
+            }
+            (0..=weights.len())
+                .map(|c| weights[..c].iter().fold(0.0, |s, w| s + w))
+                .collect()
+        }
+
+        /// The context of the pass under test, with the running sums when
+        /// the weights allow, and of its definition, without.
+        fn contexts<'a>(
+            x: &'a Data,
+            t: &'a Tessellation,
+            running: &'a [f64],
+        ) -> (Context<'a>, Context<'a>) {
+            let definition = Context {
+                x,
+                tessellation: t,
+                soft: None,
+                uniform: None,
+            };
+            let fast = Context {
+                uniform: (!running.is_empty()).then_some(running),
+                ..definition
+            };
+            (fast, definition)
+        }
+
         fn families() -> (GaussianCells, InverseGammaCells) {
             (
                 GaussianCells {
@@ -1268,17 +1381,14 @@ mod tests {
         /// `hard_partials` and its definition, as printed state.
         fn partials_pair<F: CellFamily>(family: &F, c: &Case) -> (String, String) {
             let (x, t) = any_ctx(c.cells.len());
-            let context = Context {
-                x: &x,
-                tessellation: &t,
-                soft: None,
-            };
+            let running = running(&c.weights);
+            let (fast, definition) = contexts(&x, &t, &running);
             let run = |by_add: bool| {
                 let mut out = F::Stats::default();
                 let mut partials = vec![0.0; c.cells.len()];
-                family.begin(c.mus.len(), &context, &mut out);
                 let (cells, mus, input, weights) = (&c.cells, &c.mus, &c.input, &c.weights);
                 if by_add {
+                    family.begin(c.mus.len(), &definition, &mut out);
                     hard_partials_by_add(
                         family,
                         cells,
@@ -1287,10 +1397,11 @@ mod tests {
                         weights,
                         &c.total,
                         &mut partials,
-                        &context,
+                        &definition,
                         &mut out,
                     );
                 } else {
+                    family.begin(c.mus.len(), &fast, &mut out);
                     family.hard_partials(
                         cells,
                         mus,
@@ -1298,7 +1409,7 @@ mod tests {
                         weights,
                         &c.total,
                         &mut partials,
-                        &context,
+                        &fast,
                         &mut out,
                     );
                 }
@@ -1307,19 +1418,39 @@ mod tests {
             (run(false), run(true))
         }
 
+        /// `accumulate` and its definition, as printed state.
+        fn accumulate_pair<F: CellFamily>(family: &F, c: &Case) -> (String, String) {
+            let (x, t) = any_ctx(c.cells.len());
+            let running = running(&c.weights);
+            let (fast, definition) = contexts(&x, &t, &running);
+            let (cells, input, weights, partials) = (&c.cells, &c.input, &c.weights, &c.partials);
+            let b = c.mus.len();
+            let mut got = F::Stats::default();
+            family.accumulate(cells, input, weights, partials, b, &fast, &mut got);
+            let mut want = F::Stats::default();
+            accumulate_by_add(
+                family,
+                cells,
+                input,
+                weights,
+                partials,
+                b,
+                &definition,
+                &mut want,
+            );
+            (format!("{got:?}"), format!("{want:?}"))
+        }
+
         /// The fused pass, and the running-total update followed by the
         /// next tessellation's `hard_partials`, as printed state.
         fn fused_pair<F: CellFamily>(family: &F, c: &Case) -> (String, String) {
             let (x, t) = any_ctx(c.cells.len());
-            let context = Context {
-                x: &x,
-                tessellation: &t,
-                soft: None,
-            };
+            let running = running(&c.weights);
+            let (fast, definition) = contexts(&x, &t, &running);
             let n = c.cells.len();
             let mut fused = F::Stats::default();
             let (mut total, mut partials) = (c.total.clone(), c.partials.clone());
-            family.begin(c.next_mus.len(), &context, &mut fused);
+            family.begin(c.next_mus.len(), &fast, &mut fused);
             family.hard_totals_then_partials(
                 &c.cells,
                 &c.mus,
@@ -1329,7 +1460,7 @@ mod tests {
                 &c.weights,
                 &mut total,
                 &mut partials,
-                &context,
+                &fast,
                 &mut fused,
             );
             let got = format!("{total:?} {partials:?} {fused:?}");
@@ -1339,7 +1470,7 @@ mod tests {
                 .collect();
             let mut partials = vec![0.0; n];
             let mut separate = F::Stats::default();
-            family.begin(c.next_mus.len(), &context, &mut separate);
+            family.begin(c.next_mus.len(), &definition, &mut separate);
             hard_partials_by_add(
                 family,
                 &c.next_cells,
@@ -1348,13 +1479,22 @@ mod tests {
                 &c.weights,
                 &total,
                 &mut partials,
-                &context,
+                &definition,
                 &mut separate,
             );
             (got, format!("{total:?} {partials:?} {separate:?}"))
         }
 
         proptest! {
+            #[test]
+            fn accumulate_equals_its_definition(c in case()) {
+                let (gaussian, inverse_gamma) = families();
+                let (got, want) = accumulate_pair(&gaussian, &c);
+                prop_assert_eq!(got, want);
+                let (got, want) = accumulate_pair(&inverse_gamma, &c);
+                prop_assert_eq!(got, want);
+            }
+
             #[test]
             fn hard_partials_equal_their_definition(c in case()) {
                 let (gaussian, inverse_gamma) = families();

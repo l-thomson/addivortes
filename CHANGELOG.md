@@ -436,3 +436,12 @@ says "Sampled values changed" with the reason.
   random stream is unchanged, so sampled values are the same for a
   fixed seed. The sweep benches run 4 to 10 per cent faster on one
   machine.
+- When every training row carries a weight with the same bits, a
+  cell's total weight under hard membership depends only on its count:
+  the weight added that many times in turn from zero. The ensemble forms
+  those running sums once per sweep, and the Gaussian cell statistics
+  take each cell's weight from the sum at its count in place of adding
+  the weight per row. The sums are the same additions in the same order,
+  so sampled values are the same for a fixed seed. A Gaussian or probit
+  sweep executes 9 per cent fewer instructions; on one machine its wall
+  clock moved by 0 to 5 per cent, within the noise of the comparison.

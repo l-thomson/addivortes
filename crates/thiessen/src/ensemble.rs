@@ -31,7 +31,34 @@ pub(crate) struct Ensemble<F: CellFamily> {
     assignments: Vec<Assignment>,
     /// The combined value of the ensemble at each training row.
     total: Vec<f64>,
+    /// For the sweep in progress, [`Context::uniform`]'s running sums;
+    /// empty when the weights differ.
+    running: Vec<f64>,
     scratch: Scratch<F::Stats>,
+}
+
+/// The running sums of `weights` into `out` when every weight has the
+/// same bits: entry c is c copies added in turn from zero. Empty
+/// otherwise.
+fn running_sums(weights: &[f64], out: &mut Vec<f64>) {
+    out.clear();
+    let Some(&w) = weights.first() else {
+        return;
+    };
+    if weights.iter().any(|v| v.to_bits() != w.to_bits()) {
+        return;
+    }
+    let mut sum = 0.0;
+    out.push(sum);
+    for _ in weights {
+        sum += w;
+        out.push(sum);
+    }
+}
+
+/// [`Context::uniform`] from [`running_sums`].
+fn uniform_of(running: &[f64]) -> Option<&[f64]> {
+    (!running.is_empty()).then_some(running)
 }
 
 /// The buffers of one backfitting step, kept across steps with their
@@ -114,6 +141,7 @@ impl<F: CellFamily> Ensemble<F> {
             tessellations,
             assignments,
             total: vec![total; x.n_rows()],
+            running: Vec::new(),
             scratch: Scratch::default(),
         }
     }
@@ -158,6 +186,7 @@ impl<F: CellFamily> Ensemble<F> {
     ) {
         let mut scratch = std::mem::take(&mut self.scratch);
         scratch.primed = false;
+        running_sums(weights, &mut self.running);
         for j in 0..self.tessellations.len() {
             self.backfit(
                 &mut scratch,
@@ -192,6 +221,7 @@ impl<F: CellFamily> Ensemble<F> {
             x,
             tessellation: current,
             soft,
+            uniform: uniform_of(&self.running),
         };
         self.family.begin(b, &context, &mut scratch.current);
         let n = input.len();
@@ -275,6 +305,7 @@ impl<F: CellFamily> Ensemble<F> {
                     x,
                     tessellation: &scratch.tessellation,
                     soft: proposed_weights.as_deref(),
+                    uniform: uniform_of(&self.running),
                 },
                 &mut scratch.proposed,
             );
@@ -369,6 +400,7 @@ impl<F: CellFamily> Ensemble<F> {
                 x,
                 tessellation: &self.tessellations[j],
                 soft: Some(&proposed_weights),
+                uniform: None,
             },
             &mut scratch.proposed,
         );
@@ -430,6 +462,7 @@ impl<F: CellFamily> Ensemble<F> {
                         x,
                         tessellation: next,
                         soft: None,
+                        uniform: uniform_of(&self.running),
                     };
                     self.family
                         .begin(next.n_cells(), &context, &mut scratch.current);
@@ -486,6 +519,7 @@ impl<F: CellFamily> Ensemble<F> {
         rng: &mut Rng,
     ) {
         let mut scratch = std::mem::take(&mut self.scratch);
+        running_sums(weights, &mut self.running);
         for j in 0..self.tessellations.len() {
             let tau = self.tessellations[j].tau;
             let soft = tau.map(|tau| self.assignments[j].soft_weights(tau));
@@ -501,5 +535,45 @@ impl<F: CellFamily> Ensemble<F> {
         self.assignments[j] = Assignment::full(x, &t, &self.prior.geometry);
         self.tessellations[j] = t;
         self.total.iter_mut().for_each(|v| *v = total);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn weight() -> impl Strategy<Value = f64> {
+        prop::num::f64::ANY
+    }
+
+    proptest! {
+        /// Entry c is c copies added in turn from zero, and nothing is
+        /// formed unless every weight has the same bits.
+        #[test]
+        fn running_sums_are_the_in_order_sums_of_equal_weights(
+            w in weight(),
+            n in 0usize..64,
+            other in prop::option::of((0usize..64, weight())),
+        ) {
+            let mut weights = vec![w; n];
+            if let Some((i, v)) = other {
+                if i < n {
+                    weights[i] = v;
+                }
+            }
+            let mut out = vec![1.0];
+            running_sums(&weights, &mut out);
+            let equal = weights.iter().all(|v| v.to_bits() == w.to_bits());
+            if n == 0 || !equal {
+                prop_assert!(out.is_empty());
+            } else {
+                let want: Vec<u64> = (0..=n)
+                    .map(|c| weights[..c].iter().fold(0.0, |s, v| s + v).to_bits())
+                    .collect();
+                let got: Vec<u64> = out.iter().map(|v| v.to_bits()).collect();
+                prop_assert_eq!(got, want);
+            }
+        }
     }
 }
