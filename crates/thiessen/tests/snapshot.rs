@@ -14,7 +14,8 @@
 mod common;
 
 use common::{
-    categorical_fixture, fixture, heteroscedastic_fixture, probit_fixture, spherical_fixture, SEED,
+    categorical_fixture, fixture, heteroscedastic_fixture, larger_fixture, probit_fixture,
+    spherical_fixture, SEED,
 };
 use thiessen::{Data, Fitted};
 
@@ -125,6 +126,22 @@ fn reference_target_categorical_chain_is_bit_exact() {
     assert_chain("categorical", &render(&model, &x));
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu"))]
+#[test]
+fn reference_target_larger_chain_is_bit_exact() {
+    let (config, x, y) = larger_fixture();
+    let model = thiessen::fit(&config, &x, &y, SEED).unwrap();
+    assert_chain("larger", &render(&model, &x));
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu"))]
+#[test]
+fn reference_target_two_chain_fit_is_bit_exact() {
+    let (config, x, y) = fixture();
+    let (model, _) = thiessen::fit_chains_with_threads(&config, &x, &y, SEED, 2, 2).unwrap();
+    assert_chain("two_chains", &render(&model, &x));
+}
+
 fn stored_columns(name: &str, n_columns: usize) -> Vec<Vec<f64>> {
     let stored = std::fs::read_to_string(chain_path(name))
         .expect("stored chain; regenerate on the reference target first");
@@ -190,6 +207,30 @@ fn heteroscedastic_posterior_summaries_match_the_stored_chain() {
     let model = thiessen::fit(&config, &x, &y, SEED).unwrap();
     let rendered = render_heteroscedastic(&model, &x);
     let live = parse_columns(rendered.split_once('\n').unwrap().1, 6);
+    for (a, b) in live.iter().zip(&columns) {
+        assert_close_mean_and_sd(a, b);
+    }
+}
+
+#[test]
+fn larger_posterior_summaries_match_the_stored_chain() {
+    let columns = stored_columns("larger", 4);
+    let (config, x, y) = larger_fixture();
+    let model = thiessen::fit(&config, &x, &y, SEED).unwrap();
+    let rendered = render(&model, &x);
+    let live = parse_columns(rendered.split_once('\n').unwrap().1, 4);
+    for (a, b) in live.iter().zip(&columns) {
+        assert_close_mean_and_sd(a, b);
+    }
+}
+
+#[test]
+fn two_chain_posterior_summaries_match_the_stored_chain() {
+    let columns = stored_columns("two_chains", 4);
+    let (config, x, y) = fixture();
+    let (model, _) = thiessen::fit_chains_with_threads(&config, &x, &y, SEED, 2, 2).unwrap();
+    let rendered = render(&model, &x);
+    let live = parse_columns(rendered.split_once('\n').unwrap().1, 4);
     for (a, b) in live.iter().zip(&columns) {
         assert_close_mean_and_sd(a, b);
     }
