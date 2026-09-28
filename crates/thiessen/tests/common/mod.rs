@@ -172,6 +172,31 @@ pub fn fixture() -> (Config, Data, Vec<f64>) {
     (config, x, y)
 }
 
+/// A larger fixed-seed Gaussian fixture: 300 rows of three covariates on
+/// a permuted grid and m = 5, so each tessellation holds about six cells
+/// against the three of [`fixture`].
+#[allow(dead_code)]
+pub fn larger_fixture() -> (Config, Data, Vec<f64>) {
+    let n = 300;
+    let rows: Vec<[f64; 3]> = (0..n)
+        .map(|i| {
+            let column = |j: usize| ((i * (37 + 12 * j) + 5 * j) % n) as f64 / n as f64;
+            [column(0), column(1), column(2)]
+        })
+        .collect();
+    let y: Vec<f64> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let f = (6.0 * r[0]).sin() + 2.0 * (r[1] - 0.5) * (r[1] - 0.5) + r[0] * r[2];
+            f + 0.3 * (((i * 29) % 17) as f64 / 16.0 - 0.5)
+        })
+        .collect();
+    let x = Data::from_rows(&rows).unwrap();
+    let config = Config::new().with_m(5).with_burn_in(300).with_draws(60);
+    (config, x, y)
+}
+
 /// One configuration naming each gated item of `docs/experimental.md`,
 /// with the name the feature error gives it. A build without the feature
 /// reports each from `Config::validate` as `RequiresFeature`; a build
